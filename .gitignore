@@ -1,0 +1,20 @@
+# Secrets and Configuration
+.env
+
+# Local Data Storage (Protects your POC downloads)
+extracted_emails/
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+
+# Python Cache & Bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE & OS specific files
+.vscode/
+.DS_Store
+Thumbs.db

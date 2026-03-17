@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Avocarbon Data Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 p-10 font-sans">
+
+    <div class="max-w-2xl mx-auto bg-white p-8 rounded-lg shadow-md">
+        <h1 class="text-2xl font-bold text-gray-800 mb-6">Email Scraper Control Panel</h1>
+
+        <form id="scrapeForm" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700">Search Domain</label>
+                <input type="text" id="search_domain" placeholder="e.g., valeo.com" required
+                    class="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Start Date</label>
+                    <input type="date" id="start_date" required
+                        class="mt-1 block w-full border border-gray-300 rounded-md p-2">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">End Date</label>
+                    <input type="date" id="end_date" required
+                        class="mt-1 block w-full border border-gray-300 rounded-md p-2">
+                </div>
+            </div>
+
+            <button type="submit"
+                class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded hover:bg-blue-700 transition">
+                Launch Search Engine
+            </button>
+        </form>
+
+        <div id="statusBox" class="mt-6 hidden p-4 rounded text-sm font-medium"></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('scrapeForm');
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const statusBox = document.getElementById('statusBox');
+
+        // Function to continuously check the server status
+        async function pollStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+
+                if (data.is_running) {
+                    // Still running: check again in 2.5 seconds
+                    setTimeout(pollStatus, 2500);
+                } else {
+                    // Finished! Unlock the UI.
+                    submitBtn.disabled = false;
+                    submitBtn.innerText = "Launch Search Engine";
+                    submitBtn.className = "w-full bg-blue-600 text-white font-bold py-2 px-4 rounded hover:bg-blue-700 transition";
+
+                    statusBox.className = "mt-6 p-4 rounded text-sm font-medium bg-green-100 text-green-700 block border border-green-200";
+                    statusBox.innerHTML = "✅ <strong>Scraping Complete!</strong> All emails have been processed and saved.";
+                }
+            } catch (error) {
+                console.error("Polling error:", error);
+            }
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const domain = document.getElementById('search_domain').value;
+            const start = document.getElementById('start_date').value;
+            const end = document.getElementById('end_date').value;
+
+            // Lock the button and show a spinner
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = `
+                <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Processing Emails...`;
+            submitBtn.className = "w-full bg-blue-400 text-white font-bold py-2 px-4 rounded cursor-not-allowed";
+
+            statusBox.className = "mt-6 p-4 rounded text-sm font-medium bg-blue-50 text-blue-700 block border border-blue-200";
+            statusBox.innerHTML = "📡 <strong>Connecting to Microsoft Graph...</strong> This may take a few minutes depending on email volume.";
+
+            try {
+                const response = await fetch('/api/scrape', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ search_domain: domain, start_date: start, end_date: end })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // The job started successfully, begin polling for completion!
+                    setTimeout(pollStatus, 2500);
+                } else {
+                    // API threw an error (like missing dates or already running)
+                    submitBtn.disabled = false;
+                    submitBtn.innerText = "Launch Search Engine";
+                    submitBtn.className = "w-full bg-blue-600 text-white font-bold py-2 px-4 rounded hover:bg-blue-700 transition";
+
+                    statusBox.className = "mt-6 p-4 rounded text-sm font-medium bg-red-100 text-red-700 block border border-red-200";
+                    statusBox.innerHTML = "❌ <strong>Error:</strong> " + data.error;
+                }
+            } catch (error) {
+                statusBox.className = "mt-6 p-4 rounded text-sm font-medium bg-red-100 text-red-700 block border border-red-200";
+                statusBox.innerHTML = "❌ <strong>Network Error:</strong> Could not reach the API.";
+            }
+        });
+    </script>
+</body>
+
+</html>

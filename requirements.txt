@@ -1,0 +1,8 @@
+msal 
+requests
+psycopg2-binary
+openai
+apscheduler 
+pytz
+Flask
+python-dotenv
