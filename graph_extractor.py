@@ -6,27 +6,30 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv # NEW IMPORT
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+
+# --- NEW: Azure Library ---
+from azure.storage.blob import BlobServiceClient
 
 from database_manager import insert_email, insert_attachment, initialize_database, email_exists
 from ai_helper import generate_email_summary
 
-# Load the environment variables from the .env file
 load_dotenv()
 # --- Configuration ---
 TENANT_ID = os.getenv('TENANT_ID')
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+AZURE_CONNECTION_STRING = os.getenv('AZURE_CONNECTION_STRING')
+AZURE_CONTAINER_NAME = os.getenv('AZURE_CONTAINER_NAME', 'avocarbon-emails')
+
 SEARCH_DOMAIN = 'mahle'
 BASE_OUTPUT_FOLDER = 'extracted_emails' # Local storage for POC!
 
 IS_CRON_JOB = True # Set to True so it automatically grabs the last 24 hours at midnight
-# If you want to search all time, you can set these to None
-MANUAL_START_DATE = '2026-02-01' 
-MANUAL_END_DATE = '2026-03-10'
+
 
 # Leave empty to search everyone, or add specific emails for testing
 TARGET_EMAILS = [
-     
 ]
 
 AUTHORITY = f'https://login.microsoftonline.com/{TENANT_ID}'
@@ -45,7 +48,7 @@ def get_access_token():
         result = app.acquire_token_for_client(scopes=SCOPES)
     return result.get('access_token')
 
-def download_attachments(access_token, user_email, message_id, target_folder):
+def download_attachments(access_token, user_email, message_id, cloud_folder_path):
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
     url = f"{GRAPH_ENDPOINT}/users/{user_email}/messages/{message_id}/attachments"
     
@@ -61,19 +64,38 @@ def download_attachments(access_token, user_email, message_id, target_folder):
                 if content_bytes and file_name:
                     file_data = base64.b64decode(content_bytes)
                     safe_file_name = sanitize_filename(file_name)
-                    file_path = os.path.join(target_folder, safe_file_name)
-                    
-                    # Save physical file LOCALLY
-                    with open(file_path, 'wb') as f:
-                        f.write(file_data)
-                    
-                    # Extract file extension for UI (e.g., '.pdf', '.xlsx')
                     _, file_extension = os.path.splitext(safe_file_name)
                     
-                    # Insert into Database
-                    insert_attachment(message_id, safe_file_name, file_extension.lower(), file_path)
+                    # Create the cloud path: user@domain.com/2026-03-25_hash/filename.pdf
+                    blob_name = f"{cloud_folder_path}/{safe_file_name}"
                     
-                    print(f"      ⬇️ Downloaded & logged attachment: {safe_file_name}")
+                    try:
+                        # Upload directly to Azure
+                        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+                        container_client = blob_service_client.get_container_client(AZURE_CONTAINER_NAME)
+                        blob_client = container_client.get_blob_client(blob_name)
+                        
+                        blob_client.upload_blob(file_data, overwrite=True)
+
+                        # --- GENERATE SAS TOKEN ---
+                        sas_token = generate_blob_sas(
+                            account_name=blob_service_client.account_name,
+                            container_name=AZURE_CONTAINER_NAME,
+                            blob_name=blob_name,
+                            account_key=blob_service_client.credential.account_key,
+                            permission=BlobSasPermissions(read=True),
+                            expiry=datetime.utcnow() + timedelta(days=365) # Or whatever duration you prefer
+                        )
+
+                        # Create the signed URL
+                        azure_file_url = f"{blob_client.url}?{sas_token}"
+
+                        # Save the SIGNED URL to your database
+                        insert_attachment(message_id, safe_file_name, file_extension.lower(), azure_file_url)
+                        
+                        print(f"      ☁️ Uploaded to Azure & logged: {safe_file_name}")
+                    except Exception as e:
+                        print(f"      ❌ Azure Upload Failed for {safe_file_name}: {e}")
     else:
         print(f"      ❌ Failed to download attachments: {response.status_code}")
 
@@ -135,18 +157,22 @@ def search_user_mailbox(access_token, user_email, search_term, start_date=None, 
                         print(f"  🧠 Generating AI summary for: {subject[:30]}...")
                         ai_summary = generate_email_summary(subject, body_content) 
                     
-                    # Folder structure for LOCAL saving
+                    # --- NEW: Cloud Folder Structure ---
                     clean_date = date.split('T')[0] if 'T' in date else 'UnknownDate'
                     short_id = hashlib.md5(message_id.encode('utf-8')).hexdigest()[:6]
-                    folder_name = f"{clean_date}_{short_id}"
-                    email_folder = os.path.join(BASE_OUTPUT_FOLDER, user_email, folder_name)
+                    cloud_folder_path = f"{user_email}/{clean_date}_{short_id}"
                     
-                    os.makedirs(email_folder, exist_ok=True)
+                    # Upload the email body text directly to Azure
+                    text_content = f"Date: {date}\nFrom: {sender}\nSubject: {subject}\nMessage ID: {message_id}\n"
+                    text_content += "-" * 40 + "\n\n" + body_content
                     
-                    text_file_path = os.path.join(email_folder, "email_content.txt")
-                    with open(text_file_path, 'w', encoding='utf-8') as f:
-                        f.write(f"Date: {date}\nFrom: {sender}\nSubject: {subject}\nMessage ID: {message_id}\n")
-                        f.write("-" * 40 + "\n\n" + body_content)
+                    try:
+                        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+                        container_client = blob_service_client.get_container_client(AZURE_CONTAINER_NAME)
+                        text_blob_client = container_client.get_blob_client(f"{cloud_folder_path}/email_content.txt")
+                        text_blob_client.upload_blob(text_content.encode('utf-8'), overwrite=True)
+                    except Exception as e:
+                        print(f"      ❌ Failed to upload email body to Azure: {e}")
                     
                     insert_email(
                         msg_id=message_id, conv_id=conversation_id, domain=search_term, 
@@ -156,8 +182,9 @@ def search_user_mailbox(access_token, user_email, search_term, start_date=None, 
                     print(f"  📁 Logged ({email_type}): {subject[:30]}...")
                     
                     if has_attachments:
-                        print("  📎 Attachments found. Downloading...")
-                        download_attachments(access_token, user_email, message_id, email_folder)
+                        print("  📎 Attachments found. Uploading to Azure...")
+                        # Pass the cloud folder path instead of a local path
+                        download_attachments(access_token, user_email, message_id, cloud_folder_path)
             
             url = data.get('@odata.nextLink')
             
@@ -191,6 +218,9 @@ def run_search(custom_domain=SEARCH_DOMAIN, custom_start=None, custom_end=None):
 
     # Set the active domain based on the API or fallback to the default
     active_domain = custom_domain
+
+    if not (custom_start and custom_end) and not IS_CRON_JOB:
+        raise ValueError("run_search requires custom_start/custom_end when IS_CRON_JOB is False.")
 
     if custom_start and custom_end:
         print(f"🚀 API Triggered Mode: Fetching {active_domain} from {custom_start} to {custom_end}...")

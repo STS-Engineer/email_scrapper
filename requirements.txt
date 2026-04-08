@@ -1,8 +1,10 @@
 msal 
 requests
+azure-storage-blob
 psycopg2-binary
 openai
 apscheduler 
 pytz
 Flask
 python-dotenv
+gunicorn

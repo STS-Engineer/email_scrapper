@@ -61,13 +61,11 @@ def trigger_scrape():
 
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone=pytz.timezone('Africa/Tunis'))
-    scheduler.add_job(run_search, 'cron', hour=0, minute=0)
+    scheduler.add_job(run_search, 'cron', hour=11, minute=36)
     scheduler.start()
     print("⏰ APScheduler is active in the background. Waiting for midnight...")
 
 if __name__ == '__main__':
-    if not os.path.exists(BASE_OUTPUT_FOLDER):
-        os.makedirs(BASE_OUTPUT_FOLDER)
         
     start_scheduler()
     print("🌐 Starting Avocarbon API Server...")
