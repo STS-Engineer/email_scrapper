@@ -61,7 +61,7 @@ def trigger_scrape():
 
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone=pytz.timezone('Africa/Tunis'))
-    scheduler.add_job(run_search, 'cron', hour=11, minute=36)
+    scheduler.add_job(run_search, 'cron', hour=16, minute=35)
     scheduler.start()
     print("⏰ APScheduler is active in the background. Waiting for midnight...")
 

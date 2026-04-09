@@ -1,109 +1,198 @@
-import psycopg2
 import os
+from contextlib import contextmanager
+from threading import Lock
+
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extensions import STATUS_READY
 from dotenv import load_dotenv
 
 load_dotenv()
+
 # --- PostgreSQL Configuration ---
 DB_HOST = os.getenv('DB_HOST')
-DB_PORT = os.getenv('DB_PORT', '5432') # Defaults to 5432 if not found
+DB_PORT = os.getenv('DB_PORT', '5432')
 DB_NAME = os.getenv('DB_NAME')
 DB_USER = os.getenv('DB_USER')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 
+MIN_POOL_CONNECTIONS = 1
+MAX_POOL_CONNECTIONS = 20
 
-def get_db_connection():
-    """Creates and returns a connection to the PostgreSQL database."""
-    return psycopg2.connect(
+_connection_pool = None
+_pool_lock = Lock()
+
+
+def _create_connection_pool():
+    """Builds the shared PostgreSQL connection pool."""
+    return pool.SimpleConnectionPool(
+        minconn=MIN_POOL_CONNECTIONS,
+        maxconn=MAX_POOL_CONNECTIONS,
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
-        password=DB_PASSWORD
+        password=DB_PASSWORD,
     )
+
+
+def _get_connection_pool():
+    """Initializes the connection pool lazily."""
+    global _connection_pool
+
+    if _connection_pool is None:
+        with _pool_lock:
+            if _connection_pool is None:
+                _connection_pool = _create_connection_pool()
+
+    return _connection_pool
+
+
+@contextmanager
+def get_db_connection():
+    """Yields a pooled PostgreSQL connection and always returns it."""
+    db_pool = _get_connection_pool()
+    conn = db_pool.getconn()
+    discard_connection = conn.closed != 0
+
+    try:
+        yield conn
+    finally:
+        if not discard_connection:
+            try:
+                if conn.status != STATUS_READY:
+                    conn.rollback()
+            except psycopg2.Error:
+                discard_connection = True
+
+        db_pool.putconn(conn, close=discard_connection)
+
+
+def close_db_pool():
+    """Closes all pooled PostgreSQL connections."""
+    global _connection_pool
+
+    with _pool_lock:
+        if _connection_pool is not None:
+            _connection_pool.closeall()
+            _connection_pool = None
+
 
 def initialize_database():
-    """Creates the PostgreSQL tables optimized for AI reporting and a Web UI."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Creates the PostgreSQL tables used by the scraper."""
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS Emails (
+                        message_id TEXT PRIMARY KEY,
+                        conversation_id TEXT,
+                        search_domain TEXT,
+                        sender_email TEXT,
+                        recipient_emails TEXT,
+                        received_date TEXT,
+                        subject TEXT,
+                        body_text TEXT,
+                        email_type TEXT,
+                        ai_summary TEXT
+                    )
+                    '''
+                )
 
-    # 1. The Emails Table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS Emails (
-        message_id TEXT PRIMARY KEY,
-        conversation_id TEXT,
-        search_domain TEXT,
-        sender_email TEXT,
-        recipient_emails TEXT,
-        received_date TEXT,
-        subject TEXT,
-        body_text TEXT,
-        email_type TEXT, -- 'SHORT' or 'LONG'
-        ai_summary TEXT  
-    )
-    ''')
+                cursor.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS Attachments (
+                        attachment_id SERIAL PRIMARY KEY,
+                        message_id TEXT REFERENCES Emails(message_id),
+                        file_name TEXT,
+                        file_extension TEXT,
+                        local_file_path TEXT,
+                        extracted_content TEXT
+                    )
+                    '''
+                )
 
-    # 2. The Attachments Table
-    # Note: PostgreSQL uses SERIAL for auto-incrementing IDs
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS Attachments (
-        attachment_id SERIAL PRIMARY KEY,
-        message_id TEXT REFERENCES Emails(message_id),
-        file_name TEXT,
-        file_extension TEXT,
-        local_file_path TEXT,
-        extracted_content TEXT
-    )
-    ''')
+                cursor.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS TargetMailboxes (
+                        email_address TEXT PRIMARY KEY,
+                        is_active BOOLEAN DEFAULT TRUE
+                    )
+                    '''
+                )
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print("✅ PostgreSQL database tables initialized successfully.")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    print("PostgreSQL database tables initialized successfully.")
+
 
 def insert_email(msg_id, conv_id, domain, sender, recipients, date, subject, body, email_type, summary=""):
-    """Inserts an email, using ON CONFLICT to skip if the message_id already exists."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Inserts an email and skips duplicates by message_id."""
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    '''
+                    INSERT INTO Emails
+                    (message_id, conversation_id, search_domain, sender_email, recipient_emails, received_date, subject, body_text, email_type, ai_summary)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (message_id) DO NOTHING
+                    ''',
+                    (msg_id, conv_id, domain, sender, recipients, date, subject, body, email_type, summary),
+                )
 
-    # Note: PostgreSQL uses %s for placeholders, and ON CONFLICT DO NOTHING to prevent duplicates
-    cursor.execute('''
-    INSERT INTO Emails 
-    (message_id, conversation_id, search_domain, sender_email, recipient_emails, received_date, subject, body_text, email_type, ai_summary)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (message_id) DO NOTHING
-    ''', (msg_id, conv_id, domain, sender, recipients, date, subject, body, email_type, summary))
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
 
 def insert_attachment(msg_id, file_name, file_extension, local_path):
-    """Records the downloaded file's metadata for the UI."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Records the downloaded file metadata for the UI."""
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    '''
+                    INSERT INTO Attachments (message_id, file_name, file_extension, local_file_path, extracted_content)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ''',
+                    (msg_id, file_name, file_extension, local_path, ""),
+                )
 
-    cursor.execute('''
-    INSERT INTO Attachments (message_id, file_name, file_extension, local_file_path, extracted_content)
-    VALUES (%s, %s, %s, %s, %s)
-    ''', (msg_id, file_name, file_extension, local_path, ""))
-
-    conn.commit()
-    cursor.close()
-    conn.close()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def email_exists(msg_id):
     """Checks if the email is already safely in the database."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT 1 FROM Emails WHERE message_id = %s", (msg_id,))
-    exists = cursor.fetchone() is not None
-    
-    cursor.close()
-    conn.close()
-    return exists
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM Emails WHERE message_id = %s", (msg_id,))
+            return cursor.fetchone() is not None
+
+
+def get_active_mailboxes():
+    """Returns active mailbox addresses in alphabetical order."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT email_address
+                FROM TargetMailboxes
+                WHERE is_active = TRUE
+                ORDER BY email_address
+                '''
+            )
+            return [row[0] for row in cursor.fetchall()]
+
 
 if __name__ == "__main__":
-    # Run this file directly to build your tables in pgAdmin/Postgres
     initialize_database()
+    close_db_pool()
