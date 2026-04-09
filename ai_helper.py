@@ -7,7 +7,7 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 def generate_email_summary(subject, body_text):
-    """Sends the Subject and Body to GPT-4o for a 1-2 sentence summary."""
+    """Sends the Subject and Body to gpt-4o-mini for a 1-2 sentence summary."""
     
     # Clean up empty fields just in case
     safe_subject = subject if subject else "[No Subject]"
@@ -18,7 +18,7 @@ def generate_email_summary(subject, body_text):
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4o", # Using the mini model because it is incredibly cheap and fast
+            model="gpt-4o-mini", # Using the mini model because it is incredibly cheap and fast
             messages=[
                 {
                     "role": "system", 
