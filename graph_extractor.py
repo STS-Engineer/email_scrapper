@@ -4,6 +4,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from urllib.parse import quote
 
 import msal
@@ -36,6 +37,15 @@ GRAPH_REQUEST_TIMEOUT_SECONDS = 60
 GRAPH_RETRY_LIMIT = 5
 GRAPH_RETRY_AFTER_FALLBACK_SECONDS = 30
 CLIENT_DOMAIN_BATCH_SIZE = 15
+JUNK_PATTERNS = [
+    "no-reply",
+    "noreply",
+    "notification",
+    "newsletter",
+    "mailer-daemon",
+    "do-not-reply",
+    "support@",
+]
 SYSTEM_SENDERS = [
     "info@zoll-service.eu",
     "accounting.ger@avocarbon.com",
@@ -45,6 +55,16 @@ SYSTEM_SENDERS = [
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["https://graph.microsoft.com/.default"]
 GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0"
+GRAPH_ACCESS_TOKEN = None
+_GRAPH_TOKEN_LOCK = Lock()
+
+
+def safe_print_str(text):
+    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def safe_print(message):
+    print(safe_print_str(message))
 
 
 def sanitize_filename(filename):
@@ -124,6 +144,7 @@ def parse_retry_after_seconds(retry_after_value):
 
 def graph_get(url, headers, params=None):
     last_response = None
+    auth_refresh_attempted = False
 
     for attempt in range(GRAPH_RETRY_LIMIT + 1):
         response = requests.get(
@@ -134,6 +155,17 @@ def graph_get(url, headers, params=None):
         )
         last_response = response
 
+        if response.status_code == 401 and not auth_refresh_attempted:
+            refreshed_token = get_access_token(force_refresh=True)
+            if refreshed_token:
+                headers["Authorization"] = f"Bearer {refreshed_token}"
+                auth_refresh_attempted = True
+                safe_print("Graph API returned 401. Refreshed access token and retrying request.")
+                continue
+
+            safe_print("Graph API returned 401 and token refresh failed.")
+            return response
+
         if response.status_code != 429:
             return response
 
@@ -141,35 +173,45 @@ def graph_get(url, headers, params=None):
             break
 
         retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After"))
-        print(
+        safe_print(
             f"Graph API throttled with 429. Sleeping for {retry_after_seconds} seconds "
             f"before retry {attempt + 1}/{GRAPH_RETRY_LIMIT}."
         )
         time.sleep(retry_after_seconds)
 
-    print(f"Graph API request failed after {GRAPH_RETRY_LIMIT} retries due to throttling.")
+    safe_print(f"Graph API request failed after {GRAPH_RETRY_LIMIT} retries due to throttling.")
     return last_response
 
 
 def build_graph_headers(access_token):
+    token = GRAPH_ACCESS_TOKEN or access_token
     return {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Prefer": 'outlook.body-content-type="text"',
         "ConsistencyLevel": "eventual",
     }
 
 
-def get_access_token():
-    app = msal.ConfidentialClientApplication(
-        CLIENT_ID,
-        authority=AUTHORITY,
-        client_credential=CLIENT_SECRET,
-    )
-    result = app.acquire_token_silent(SCOPES, account=None)
-    if not result:
-        result = app.acquire_token_for_client(scopes=SCOPES)
-    return result.get("access_token")
+def get_access_token(force_refresh=False):
+    global GRAPH_ACCESS_TOKEN
+
+    with _GRAPH_TOKEN_LOCK:
+        app = msal.ConfidentialClientApplication(
+            CLIENT_ID,
+            authority=AUTHORITY,
+            client_credential=CLIENT_SECRET,
+        )
+
+        result = None
+        if not force_refresh:
+            result = app.acquire_token_silent(SCOPES, account=None)
+
+        if not result:
+            result = app.acquire_token_for_client(scopes=SCOPES)
+
+        GRAPH_ACCESS_TOKEN = result.get("access_token")
+        return GRAPH_ACCESS_TOKEN
 
 
 def get_matched_domain(domain_batch, sender, recipients, subject, body_content):
@@ -211,11 +253,11 @@ def download_attachments(access_token, user_email, graph_message_id, global_msg_
 
     response = graph_get(url, headers=headers)
     if response is None:
-        print(f"      Failed to fetch attachments for {user_email}: no response received.")
+        safe_print(f"      Failed to fetch attachments for {user_email}: no response received.")
         return
 
     if response.status_code != 200:
-        print(f"      Failed to download attachments for {user_email}: {response.status_code}")
+        safe_print(f"      Failed to download attachments for {user_email}: {response.status_code}")
         return
 
     attachments = response.json().get("value", [])
@@ -255,9 +297,9 @@ def download_attachments(access_token, user_email, graph_message_id, global_msg_
 
             azure_file_url = f"{blob_client.url}?{sas_token}"
             insert_attachment(global_msg_id, safe_file_name, file_extension.lower(), azure_file_url)
-            print(f"      Uploaded to Azure and logged: {safe_file_name}")
+            safe_print(f"      Uploaded to Azure and logged: {safe_file_name}")
         except Exception as exc:
-            print(f"      Azure upload failed for {safe_file_name}: {exc}")
+            safe_print(f"      Azure upload failed for {safe_file_name}: {exc}")
 
 
 def search_user_mailbox(access_token, user_email, client_domains, start_utc, end_utc):
@@ -266,7 +308,7 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
     base_url = f"{GRAPH_ENDPOINT}/users/{encoded_user_email}/messages"
     select_fields = (
         "id,internetMessageId,conversationId,subject,sender,toRecipients,"
-        "receivedDateTime,hasAttachments,body"
+        "receivedDateTime,hasAttachments,body,uniqueBody"
     )
 
     # Graph API $search on /messages does not support date filtering in KQL
@@ -294,46 +336,64 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
             "$top": 100,
         }
 
-        print(
+        safe_print(
             f"Searching {user_email} with domain batch {batch_number} "
             f"({len(domain_batch)} domains) for window {start_utc} -> {end_utc}."
         )
         next_url = base_url
         next_params = params
+        page_count = 0
+        MAX_PAGES = 50
 
         while next_url:
+            page_count += 1
+            if page_count > MAX_PAGES:
+                safe_print("Circuit breaker tripped! Exceeded 50 pages.")
+                break
+
             response = graph_get(next_url, headers=headers, params=next_params)
             next_params = None
 
             if response is None:
-                print(f"Failed to search {user_email}: no response received.")
+                safe_print(f"Failed to search {user_email}: no response received.")
                 break
 
             if response.status_code == 404:
-                print(f"Mailbox not found or inaccessible: {user_email}")
+                safe_print(f"Mailbox not found or inaccessible: {user_email}")
                 return
 
             if response.status_code != 200:
-                print(f"Failed to search {user_email}: {response.status_code} - {response.text}")
+                safe_print(f"Failed to search {user_email}: {response.status_code} - {response.text}")
                 break
 
             data = response.json()
             emails = data.get("value", [])
 
             if emails:
-                print(f"Processing page of {len(emails)} emails for {user_email}...")
+                safe_print(f"Processing page of {len(emails)} emails for {user_email}...")
 
             for email in emails:
                 graph_msg_id = email.get("id")
                 global_msg_id = email.get("internetMessageId") or graph_msg_id
                 subject = email.get("subject") or "No Subject"
+                sender = email.get("sender", {}).get("emailAddress", {}).get("address", "Unknown Sender")
+                sender_lower = sender.lower()
+
+                if sender_lower in SYSTEM_SENDERS or any(
+                    pattern in sender_lower for pattern in JUNK_PATTERNS
+                ):
+                    safe_print(
+                        "  Dropping junk email... "
+                        f"sender={sender_lower}, subject={subject[:30]}..."
+                    )
+                    continue
 
                 if not global_msg_id:
-                    print(f"  Skipping message without a stable ID: {subject[:30]}...")
+                    safe_print(f"  Skipping message without a stable ID: {subject[:30]}...")
                     continue
 
                 if email_exists(global_msg_id):
-                    print(f"  Skipping duplicate: {subject[:30]}...")
+                    safe_print(f"  Skipping duplicate: {subject[:30]}...")
                     continue
 
                 conversation_id = email.get("conversationId", "Unknown")
@@ -347,14 +407,15 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
                 except (ValueError, AttributeError):
                     pass  # If parsing fails, let the email through rather than silently drop it.
                 has_attachments = bool(email.get("hasAttachments"))
-                sender = email.get("sender", {}).get("emailAddress", {}).get("address", "Unknown Sender")
 
                 to_recipients = [
                     recipient.get("emailAddress", {}).get("address", "")
                     for recipient in email.get("toRecipients", [])
                 ]
                 recipients_string = ", ".join(filter(None, to_recipients))
-                body_content = email.get("body", {}).get("content", "").strip()
+                unique_body = email.get("uniqueBody", {}).get("content", "").strip()
+                full_body = email.get("body", {}).get("content", "").strip()
+                body_content = unique_body if unique_body else full_body
                 total_text_length = len(subject) + len(body_content)
                 matched_domain = get_matched_domain(
                     domain_batch,
@@ -365,17 +426,31 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
                 )
 
                 ai_summary = ""
-                sender_lower = sender.lower()
-                if sender_lower in SYSTEM_SENDERS:
+                subject_lower = subject.lower()
+                is_ooo_or_bounce = any(
+                    phrase in subject_lower
+                    for phrase in [
+                        "out of office",
+                        "automatic reply",
+                        "undeliverable",
+                        "delivery status notification",
+                        "auto-reply",
+                        "absence",
+                    ]
+                )
+                if sender_lower in SYSTEM_SENDERS or is_ooo_or_bounce:
                     email_type = "SYSTEM"
-                    ai_summary = "Automated system notification."
-                    print(f"  Bypassing AI summary for system sender: {sender_lower}")
-                elif total_text_length < 300:
+                    ai_summary = "Automated system notification or auto-reply."
+                    safe_print(
+                        "  Bypassing AI summary for automated message: "
+                        f"sender={sender_lower}, subject={subject[:30]}..."
+                    )
+                elif total_text_length < 800:
                     email_type = "SHORT"
                 else:
                     email_type = "LONG"
-                    print(f"  Generating AI summary for: {subject[:30]}...")
-                    ai_summary = generate_email_summary(subject, body_content)
+                    safe_print(f"  Generating AI summary for: {subject[:30]}...")
+                    ai_summary = generate_email_summary(subject, body_content[:3000])
 
                 clean_date = received_date.split("T")[0] if "T" in received_date else "UnknownDate"
                 short_id = hashlib.md5(global_msg_id.encode("utf-8")).hexdigest()[:6]
@@ -392,7 +467,7 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
                 try:
                     upload_email_body(cloud_folder_path, text_content)
                 except Exception as exc:
-                    print(f"      Failed to upload email body to Azure: {exc}")
+                    safe_print(f"      Failed to upload email body to Azure: {exc}")
 
                 insert_email(
                     msg_id=global_msg_id,
@@ -406,11 +481,11 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
                     email_type=email_type,
                     summary=ai_summary,
                 )
-                print(f"  Logged ({email_type}): {subject[:30]}...")
+                safe_print(f"  Logged ({email_type}): {subject[:30]}...")
 
                 if has_attachments:
                     if graph_msg_id:
-                        print("  Attachments found. Uploading to Azure...")
+                        safe_print("  Attachments found. Uploading to Azure...")
                         download_attachments(
                             access_token,
                             user_email,
@@ -419,7 +494,7 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
                             cloud_folder_path,
                         )
                     else:
-                        print("  Attachments skipped because the Graph message ID is missing.")
+                        safe_print("  Attachments skipped because the Graph message ID is missing.")
 
             next_url = data.get("@odata.nextLink")
 
@@ -427,30 +502,30 @@ def search_user_mailbox(access_token, user_email, client_domains, start_utc, end
 def run_search(custom_domain=SEARCH_DOMAIN, custom_start=None, custom_end=None):
     initialize_database()
 
-    print("Authenticating...")
+    safe_print("Authenticating...")
     token = get_access_token()
     if not token:
-        print("Authentication failed. No access token was returned.")
+        safe_print("Authentication failed. No access token was returned.")
         return
 
     client_domains = normalize_client_domains(custom_domain)
     if not client_domains:
-        print("No client domains were provided. Nothing to search.")
+        safe_print("No client domains were provided. Nothing to search.")
         return
 
     start_utc, end_utc = resolve_search_window(custom_start, custom_end)
     users_to_search = get_active_mailboxes()
 
     if not users_to_search:
-        print("No active target mailboxes found in TargetMailboxes. Nothing to search.")
+        safe_print("No active target mailboxes found in TargetMailboxes. Nothing to search.")
         return
 
-    print(
+    safe_print(
         f"Starting mailbox scan for {len(users_to_search)} active mailboxes "
         f"across {len(client_domains)} client domains."
     )
-    print(f"Search window: {start_utc} -> {end_utc}")
-    print("=" * 60)
+    safe_print(f"Search window: {start_utc} -> {end_utc}")
+    safe_print("=" * 60)
 
     for mailbox in users_to_search:
         search_user_mailbox(token, mailbox, client_domains, start_utc, end_utc)

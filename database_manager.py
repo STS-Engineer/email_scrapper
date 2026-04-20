@@ -48,11 +48,50 @@ def _get_connection_pool():
     return _connection_pool
 
 
+def _ping_connection(conn):
+    """Runs a lightweight query to confirm the pooled connection is still alive."""
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+
+    if conn.status != STATUS_READY:
+        conn.rollback()
+
+
+def _acquire_healthy_connection():
+    """Borrows a connection from the pool and replaces stale sockets if needed."""
+    db_pool = _get_connection_pool()
+    conn = db_pool.getconn()
+
+    try:
+        _ping_connection(conn)
+        return db_pool, conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        try:
+            db_pool.putconn(conn, close=True)
+        except Exception:
+            pass
+
+        close_db_pool()
+        db_pool = _get_connection_pool()
+        conn = db_pool.getconn()
+
+        try:
+            _ping_connection(conn)
+        except Exception:
+            try:
+                db_pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            raise
+
+        return db_pool, conn
+
+
 @contextmanager
 def get_db_connection():
     """Yields a pooled PostgreSQL connection and always returns it."""
-    db_pool = _get_connection_pool()
-    conn = db_pool.getconn()
+    db_pool, conn = _acquire_healthy_connection()
     discard_connection = conn.closed != 0
 
     try:
@@ -119,6 +158,34 @@ def initialize_database():
                         email_address TEXT PRIMARY KEY,
                         is_active BOOLEAN DEFAULT TRUE
                     )
+                    '''
+                )
+
+                cursor.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS Conversations (
+                        conversation_id VARCHAR NOT NULL,
+                        search_domain VARCHAR NOT NULL,
+                        started_date TIMESTAMP WITH TIME ZONE,
+                        last_updated_date TIMESTAMP WITH TIME ZONE,
+                        email_count INTEGER,
+                        summary TEXT,
+                        PRIMARY KEY (conversation_id, search_domain)
+                    )
+                    '''
+                )
+
+                cursor.execute(
+                    '''
+                    ALTER TABLE Conversations
+                    ADD COLUMN IF NOT EXISTS ai_analysis JSONB
+                    '''
+                )
+
+                cursor.execute(
+                    '''
+                    ALTER TABLE Conversations
+                    ADD COLUMN IF NOT EXISTS involved_employees JSONB NOT NULL DEFAULT '[]'::jsonb
                     '''
                 )
 
