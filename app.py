@@ -5,9 +5,13 @@ import pytz
 import os
 
 from graph_extractor import run_search, BASE_OUTPUT_FOLDER, SEARCH_DOMAIN
+from conversation_rollup import run_rollup
 
 app = Flask(__name__)
 CRON_SECRET = os.getenv("CRON_SECRET", "super_secret_fallback_key")
+
+# Each client is scraped individually to avoid Graph API search-term conflicts
+NIGHTLY_CLIENTS = ["mahle", "nidec", "valeo"]
 
 
 def safe_print_str(text):
@@ -37,16 +41,32 @@ def scrape_worker(domain, start_date, end_date):
         scraping_status["is_running"] = False
 
 
-def cron_scrape_worker():
-    """Runs the default scheduled scrape while updating shared status."""
+def nightly_pipeline():
+    """Scrapes each client individually for the last 24h, then runs conversation rollup."""
     global scraping_status
     scraping_status["is_running"] = True
     try:
-        run_search()
-    except Exception as e:
-        safe_print(f"External trigger scraping error: {e}")
+        for client in NIGHTLY_CLIENTS:
+            safe_print(f"=== Nightly scrape: starting client '{client}' ===")
+            try:
+                run_search(custom_domain=client)
+            except Exception as e:
+                safe_print(f"Nightly scrape error for '{client}': {e}")
+
+        safe_print("=== Nightly scrape complete. Starting conversation rollup... ===")
+        try:
+            run_rollup()
+        except Exception as e:
+            safe_print(f"Nightly rollup error: {e}")
+
+        safe_print("=== Nightly pipeline finished ===")
     finally:
         scraping_status["is_running"] = False
+
+
+def cron_scrape_worker():
+    """Runs the full nightly pipeline (used by the external trigger endpoint)."""
+    nightly_pipeline()
 
 
 @app.route('/')
@@ -107,12 +127,22 @@ def trigger_external_scrape():
 
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone=pytz.timezone('Africa/Tunis'))
-    scheduler.add_job(run_search, 'cron', hour=16, minute=35)
+    scheduler.add_job(
+        nightly_pipeline,
+        'cron',
+        hour=0,
+        minute=0,
+        id='nightly_pipeline',
+        replace_existing=True,
+    )
     scheduler.start()
-    safe_print("APScheduler is active in the background. Waiting for midnight...")
+    safe_print("APScheduler active. Nightly pipeline scheduled for 00:00 Africa/Tunis.")
+
+
+# Start at module level so Gunicorn picks it up (not just `python app.py`)
+start_scheduler()
 
 
 if __name__ == '__main__':
-    start_scheduler()
     safe_print("Starting Avocarbon API Server...")
     app.run(host='0.0.0.0', port=5000, debug=False)
