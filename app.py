@@ -17,7 +17,7 @@ ENABLE_LOCAL_SCHEDULER = os.getenv("ENABLE_LOCAL_SCHEDULER", "false").strip().lo
 }
 
 # Each client is scraped individually to avoid Graph API search-term conflicts
-NIGHTLY_CLIENTS = ["mahle", "nidec", "valeo"]
+NIGHTLY_CLIENTS = ["mahle", "@nidec", "valeo"]
 
 
 def safe_print_str(text):

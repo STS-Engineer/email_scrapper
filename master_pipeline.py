@@ -6,7 +6,7 @@ from conversation_rollup import run_rollup
 from database_manager import close_db_pool
 from graph_extractor import run_search
 
-NIGHTLY_CLIENTS = ["mahle", "nidec", "valeo"]
+NIGHTLY_CLIENTS = ["mahle", "@nidec", "valeo"]
 
 
 def configure_logging():

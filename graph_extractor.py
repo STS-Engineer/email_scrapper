@@ -30,7 +30,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
 AZURE_CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME", "avocarbon-emails")
 
-SEARCH_DOMAIN = "mahle,valeo,nidec,bosch"
+SEARCH_DOMAIN = "mahle,@nidec,valeo,bosch"
 BASE_OUTPUT_FOLDER = "extracted_emails"
 
 GRAPH_REQUEST_TIMEOUT_SECONDS = 60
