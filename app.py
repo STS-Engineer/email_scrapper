@@ -9,6 +9,12 @@ from conversation_rollup import run_rollup
 
 app = Flask(__name__)
 CRON_SECRET = os.getenv("CRON_SECRET", "super_secret_fallback_key")
+ENABLE_LOCAL_SCHEDULER = os.getenv("ENABLE_LOCAL_SCHEDULER", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Each client is scraped individually to avoid Graph API search-term conflicts
 NIGHTLY_CLIENTS = ["mahle", "nidec", "valeo"]
@@ -139,8 +145,11 @@ def start_scheduler():
     safe_print("APScheduler active. Nightly pipeline scheduled for 00:00 Africa/Tunis.")
 
 
-# Start at module level so Gunicorn picks it up (not just `python app.py`)
-start_scheduler()
+# Start at module level only when explicitly enabled.
+if ENABLE_LOCAL_SCHEDULER:
+    start_scheduler()
+else:
+    safe_print("APScheduler disabled. Set ENABLE_LOCAL_SCHEDULER=true to enable local scheduling.")
 
 
 if __name__ == '__main__':
